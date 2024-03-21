@@ -42,24 +42,21 @@ use aruna_rust_api::api::storage::services::v2::get_hierarchy_response::Graph;
 use aruna_rust_api::api::storage::services::v2::Rule as APIRule;
 use aruna_rust_api::api::storage::services::v2::UserPermission;
 use async_channel::Sender;
-use chrono::NaiveDateTime;
+use chrono::Utc;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use diesel_ulid::DieselUlid;
-use evmap::shallow_copy::CopyValue;
-use evmap::ReadHandleFactory;
-use evmap::WriteHandle;
 use itertools::Itertools;
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 pub struct Cache {
     object_cache: DashMap<DieselUlid, ObjectWithRelations, RandomState>,
-    stats_reader: ReadHandleFactory<DieselUlid, CopyValue<ObjectStats>>, //RwLock<ReadHandle<DieselUlid, ObjectStats>>,
-    stats_writer: Arc<Mutex<WriteHandle<DieselUlid, CopyValue<ObjectStats>>>>,
+    stats: DashMap<DieselUlid, Arc<RwLock<ObjectStats>>, RandomState>,
+    stats_queue: HashMap<DieselUlid, i64>,
     user_cache: DashMap<DieselUlid, User, RandomState>,
     pubkeys: DashMap<i16, PubKeyEnum, RandomState>,
     issuer_info: DashMap<String, Issuer>,
@@ -72,12 +69,11 @@ pub struct Cache {
 impl Cache {
     pub fn new() -> Arc<Self> {
         let (issuer_sender, issuer_recv) = async_channel::bounded(50);
-        let (stats_reader, stats_writer) = evmap::new();
 
         let cache = Arc::new(Self {
             object_cache: DashMap::default(),
-            stats_reader: stats_reader.factory(),
-            stats_writer: Arc::new(Mutex::new(stats_writer)),
+            stats: DashMap::default(),
+            stats_queue: HashMap::default(),
             user_cache: DashMap::default(),
             pubkeys: DashMap::default(),
             issuer_info: DashMap::default(),
@@ -105,19 +101,39 @@ impl Cache {
         self.pubkeys.clear();
         let client = db.get_client().await?;
 
-        let all_objects = get_all_objects_with_relations(&client).await?;
+        let mut all_objects = get_all_objects_with_relations(&client).await?;
+        all_objects.sort_by(|a, b| a.object.object_type.cmp(&b.object.object_type));
+        let mut stats_cache = HashMap::default();
         for obj in all_objects {
-            self.object_cache.insert(obj.object.id, obj);
+            if obj.object.object_type == ObjectType::OBJECT {
+                stats_cache.insert(obj.object.id, (1, obj.object.content_len));
+            }
+
+            self.object_cache.insert(obj.object.id, obj.clone());
+            for parent in obj.get_parents() {
+                let (count, size) = if obj.object.object_type == ObjectType::OBJECT {
+                    (1, obj.object.content_len)
+                } else {
+                    stats_cache.get(&obj.object.id).map_or((0, 0), |x| *x)
+                };
+                let entry = stats_cache.entry(parent).or_insert((0, 0));
+                entry.0 += count;
+                entry.1 += size;
+            }
+        }
+
+        for (k, v) in stats_cache {
+            self.stats.insert(
+                k,
+                Arc::new(RwLock::new(ObjectStats {
+                    count: v.0,
+                    size: v.1,
+                    last_refresh: Utc::now().naive_utc(),
+                })),
+            );
         }
 
         // Object stats update
-        let mut stats_writer = self.stats_writer.lock().await;
-        stats_writer.purge(); // Clear object stats map
-        for stats in ObjectStats::get_all_stats(&client).await? {
-            stats_writer.insert(stats.origin_pid, stats.into());
-        }
-        stats_writer.refresh();
-        drop(stats_writer);
 
         let users = User::all(&client).await?;
         for user in users {
@@ -293,20 +309,12 @@ impl Cache {
         }
     }
 
-    pub fn get_object_stats(&self, id: &DieselUlid) -> Option<CopyValue<ObjectStats>> {
-        match self.stats_reader.handle().get(id) {
-            Some(guard) => {
-                let default: CopyValue<ObjectStats> = ObjectStats {
-                    origin_pid: *id,
-                    count: 0,
-                    size: 0,
-                    last_refresh: NaiveDateTime::default(),
-                }
-                .into();
-                Some(*guard.get_one().unwrap_or(&default))
-            }
-            None => None,
-        }
+    pub async fn get_object_stats(&self, id: &DieselUlid) -> Option<ObjectStats> {
+        let object_ref = self.stats.get(id)?;
+
+        let result = object_ref.read().await.clone();
+
+        Some(result)
     }
 
     pub fn add_stats_to_object<'a, 'b: 'a>(&'a self, object: &'b mut ObjectWithRelations) {

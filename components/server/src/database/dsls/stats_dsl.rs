@@ -17,92 +17,11 @@ use crate::{
     utils::search_utils,
 };
 
-#[derive(Copy, Clone, Debug, FromRow, Eq)]
+#[derive(Copy, Clone, Debug, FromRow, Hash)]
 pub struct ObjectStats {
-    pub origin_pid: DieselUlid,
     pub count: i64,
     pub size: i64,
     pub last_refresh: NaiveDateTime,
-}
-
-impl Ord for ObjectStats {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Ignore timestamp in order
-        (self.origin_pid, self.count, self.size).cmp(&(other.origin_pid, other.count, other.size))
-    }
-}
-
-impl PartialOrd for ObjectStats {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for ObjectStats {
-    fn eq(&self, other: &Self) -> bool {
-        // Ignore timestamp in equality comparison
-        self.origin_pid == other.origin_pid && self.count == other.count && self.size == other.size
-    }
-}
-
-impl Hash for ObjectStats {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Also ignore timestamp in hash to fulfill agreement with PartialEq
-        self.origin_pid.hash(state);
-        self.count.hash(state);
-        self.size.hash(state);
-    }
-}
-
-impl ObjectStats {
-    pub async fn get_object_stats(id: &DieselUlid, client: &Client) -> Result<Self> {
-        let query = "SELECT * FROM object_stats WHERE origin_pid = $1;";
-        let prepared = client.prepare(query).await?;
-
-        let stats = match client.query_opt(&prepared, &[&id]).await? {
-            Some(row) => ObjectStats::from_row(&row),
-            None => ObjectStats {
-                origin_pid: *id,
-                count: 1,
-                size: 0,
-                last_refresh: NaiveDateTime::default(),
-            },
-        };
-
-        Ok(stats)
-    }
-
-    pub async fn get_all_stats(client: &Client) -> Result<Vec<Self>> {
-        let query = "SELECT * FROM object_stats;";
-        let prepared = client.prepare(query).await?;
-
-        let rows = client.query(&prepared, &[]).await?;
-
-        let stats = rows.iter().map(ObjectStats::from_row).collect_vec();
-
-        Ok(stats)
-    }
-}
-
-pub async fn refresh_stats_view(client: &Client) -> Result<()> {
-    let query = "REFRESH MATERIALIZED VIEW object_stats;";
-    let prepared = client.prepare(query).await?;
-
-    client.execute(&prepared, &[]).await?;
-
-    Ok(())
-}
-
-pub async fn get_last_refresh(client: &Client) -> Result<NaiveDateTime> {
-    let query = "SELECT last_refresh FROM object_stats LIMIT 1;";
-    let prepared = client.prepare(query).await?;
-
-    let last_refreshed: NaiveDateTime = match client.query_opt(&prepared, &[]).await? {
-        Some(row) => row.get("last_refresh"),
-        None => bail!("Object stats table is empty"),
-    };
-
-    Ok(last_refreshed)
 }
 
 pub async fn start_refresh_loop(
